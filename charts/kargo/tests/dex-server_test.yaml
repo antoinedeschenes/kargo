@@ -80,3 +80,28 @@ tests:
       - equal:
           path: metadata.name
           value: kargo-dex-server
+
+  - it: omits the expiry block when no expiry values are set (default)
+    set:
+      api.oidc.enabled: true
+      api.oidc.dex.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: stringData["config.yaml"]
+          pattern: "expiry:"
+
+  - it: renders the expiry block when expiry values are set
+    set:
+      api.oidc.enabled: true
+      api.oidc.dex.enabled: true
+      api.oidc.dex.expiry:
+        idTokens: 2m
+        refreshTokens:
+          validIfNotUsedFor: 24h
+    asserts:
+      - matchRegex:
+          path: stringData["config.yaml"]
+          pattern: "\nexpiry:\n  idTokens: 2m\n"
+      - matchRegex:
+          path: stringData["config.yaml"]
+          pattern: "\n  refreshTokens:\n    validIfNotUsedFor: 24h\n"
