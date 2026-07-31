@@ -22,6 +22,10 @@ api:
     enabled: true
     dex:
       enabled: true
+      # A short ID token lifetime exercises the UI's token renewal continuously.
+      expiry:
+        idTokens: 2m
+      logLevel: DEBUG
       connectors:
       - id: mock
         name: Example
