@@ -3,6 +3,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { authTokenKey, refreshTokenKey } from '../../config/auth';
 
 import { customFetch } from './custom-fetch';
+import { clearTokens, getValidToken, refreshOnce } from './token-refresh';
+
+vi.mock('./token-refresh', () => ({
+  clearTokens: vi.fn(),
+  getValidToken: vi.fn(),
+  refreshOnce: vi.fn()
+}));
+
+const getValidTokenMock = vi.mocked(getValidToken);
+const refreshOnceMock = vi.mocked(refreshOnce);
+const clearTokensMock = vi.mocked(clearTokens);
 
 // The tests run in Vitest's default node environment, which has neither
 // localStorage nor window.
@@ -20,12 +31,11 @@ const fakeLocalStorage = () => {
   };
 };
 
-// Builds an unsigned JWT whose exp is `offsetSeconds` from now. customFetch
-// only parses the payload, so a real signature is unnecessary.
-const jwt = (offsetSeconds: number) => {
-  const payload = { exp: Math.floor(Date.now() / 1000) + offsetSeconds };
-  return `header.${btoa(JSON.stringify(payload))}.signature`;
-};
+const unauthorizedResponse = () =>
+  new Response('{"error":"invalid token"}', {
+    status: 401,
+    headers: { 'content-type': 'application/json' }
+  });
 
 describe('customFetch', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
@@ -44,27 +54,44 @@ describe('customFetch', () => {
     fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     stubWindow('/');
+    getValidTokenMock.mockReset().mockResolvedValue(null);
+    refreshOnceMock.mockReset().mockResolvedValue(null);
+    clearTokensMock.mockReset();
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  test('navigates to the renewal page when the token has expired and a refresh token exists', async () => {
-    localStorage.setItem(authTokenKey, jwt(-60));
-    localStorage.setItem(refreshTokenKey, 'refresh-1');
+  test('attaches the renewed token to authenticated requests', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
+    getValidTokenMock.mockResolvedValue('fresh-token');
+
+    await customFetch('/v1beta1/projects');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+      Authorization: 'Bearer fresh-token'
+    });
+    expect(replaceMock).not.toHaveBeenCalled();
+  });
+
+  test('ends the session when a stored token cannot be renewed', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
+    getValidTokenMock.mockResolvedValue(null);
 
     await expect(customFetch('/v1beta1/projects')).rejects.toMatchObject({ status: 401 });
-    expect(replaceMock).toHaveBeenCalledWith('/token-renew?redirectTo=/');
+    expect(clearTokensMock).toHaveBeenCalled();
+    expect(replaceMock).toHaveBeenCalledWith('/login?redirectTo=%2F');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  test('does not block requests to exempt endpoints on an expired token', async () => {
-    localStorage.setItem(authTokenKey, jwt(-60));
-    localStorage.setItem(refreshTokenKey, 'refresh-1');
+  test('does not renew or attach a token for exempt endpoints', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
 
     await customFetch('/v1beta1/system/public-server-config');
 
+    expect(getValidTokenMock).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty('Authorization');
     expect(replaceMock).not.toHaveBeenCalled();
@@ -79,53 +106,86 @@ describe('customFetch', () => {
     ['a trailing slash and a query string', '/v1beta1/system/public-server-config/?ts=1'],
     ['dot segments', '/v1beta1/projects/../system/./public-server-config']
   ])('matches an exempt endpoint written with %s', async ([, url]) => {
-    localStorage.setItem(authTokenKey, jwt(-60));
-    localStorage.setItem(refreshTokenKey, 'refresh-1');
+    localStorage.setItem(authTokenKey, 'stored-token');
 
     await customFetch(url);
 
+    expect(getValidTokenMock).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty('Authorization');
-    expect(replaceMock).not.toHaveBeenCalled();
   });
 
   test('does not treat a non-exempt endpoint as exempt because of a shared prefix', async () => {
-    localStorage.setItem(authTokenKey, jwt(-60));
-    localStorage.setItem(refreshTokenKey, 'refresh-1');
+    localStorage.setItem(authTokenKey, 'stored-token');
+    getValidTokenMock.mockResolvedValue('fresh-token');
 
-    await expect(customFetch('/v1beta1/login/extra')).rejects.toMatchObject({ status: 401 });
-    expect(replaceMock).toHaveBeenCalledWith('/token-renew?redirectTo=/');
-    expect(fetchMock).not.toHaveBeenCalled();
+    await customFetch('/v1beta1/login/extra');
+
+    expect(getValidTokenMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+      Authorization: 'Bearer fresh-token'
+    });
   });
 
   test('does not end the session on a 401 from an exempt endpoint', async () => {
-    localStorage.setItem(authTokenKey, jwt(-60));
+    localStorage.setItem(authTokenKey, 'stored-token');
     localStorage.setItem(refreshTokenKey, 'refresh-1');
-    fetchMock.mockResolvedValue(
-      new Response('{"error":"invalid token"}', {
-        status: 401,
-        headers: { 'content-type': 'application/json' }
-      })
-    );
+    fetchMock.mockImplementation(() => Promise.resolve(unauthorizedResponse()));
 
     await expect(customFetch('/v1beta1/login')).rejects.toMatchObject({ status: 401 });
-    expect(localStorage.getItem(authTokenKey)).not.toBeNull();
-    expect(localStorage.getItem(refreshTokenKey)).toBe('refresh-1');
+    expect(refreshOnceMock).not.toHaveBeenCalled();
+    expect(clearTokensMock).not.toHaveBeenCalled();
     expect(replaceMock).not.toHaveBeenCalled();
   });
 
-  test('ends the session on a 401 received elsewhere', async () => {
-    localStorage.setItem(authTokenKey, jwt(3600));
+  test('renews and retries once when the server rejects the token', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
     localStorage.setItem(refreshTokenKey, 'refresh-1');
-    fetchMock.mockResolvedValue(
-      new Response('{"error":"invalid token"}', {
-        status: 401,
-        headers: { 'content-type': 'application/json' }
-      })
-    );
+    getValidTokenMock.mockResolvedValue('stale-token');
+    refreshOnceMock.mockResolvedValue('fresh-token');
+    fetchMock
+      .mockResolvedValueOnce(unauthorizedResponse())
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    await customFetch('/v1beta1/projects');
+
+    expect(refreshOnceMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(clearTokensMock).not.toHaveBeenCalled();
+    expect(replaceMock).not.toHaveBeenCalled();
+  });
+
+  test('ends the session when a 401 persists after renewal', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
+    localStorage.setItem(refreshTokenKey, 'refresh-1');
+    getValidTokenMock.mockResolvedValue('stale-token');
+    refreshOnceMock.mockResolvedValue('fresh-token');
+    fetchMock.mockImplementation(() => Promise.resolve(unauthorizedResponse()));
 
     await expect(customFetch('/v1beta1/projects')).rejects.toMatchObject({ status: 401 });
-    expect(localStorage.getItem(authTokenKey)).toBeNull();
-    expect(replaceMock).toHaveBeenCalledWith('/login?redirectTo=/');
+    expect(refreshOnceMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(clearTokensMock).toHaveBeenCalled();
+    expect(replaceMock).toHaveBeenCalledWith('/login?redirectTo=%2F');
+  });
+
+  test('ends the session on a 401 when no refresh token exists', async () => {
+    localStorage.setItem(authTokenKey, 'stored-token');
+    getValidTokenMock.mockResolvedValue('admin-token');
+    fetchMock.mockImplementation(() => Promise.resolve(unauthorizedResponse()));
+
+    await expect(customFetch('/v1beta1/projects')).rejects.toMatchObject({ status: 401 });
+    expect(refreshOnceMock).not.toHaveBeenCalled();
+    expect(clearTokensMock).toHaveBeenCalled();
+    expect(replaceMock).toHaveBeenCalledWith('/login?redirectTo=%2F');
+  });
+
+  test('omits redirectTo when logging out on the login page', async () => {
+    stubWindow('/login');
+    localStorage.setItem(authTokenKey, 'stored-token');
+    getValidTokenMock.mockResolvedValue(null);
+
+    await expect(customFetch('/v1beta1/projects')).rejects.toMatchObject({ status: 401 });
+    expect(replaceMock).toHaveBeenCalledWith('/login');
   });
 });

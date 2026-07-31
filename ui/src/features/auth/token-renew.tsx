@@ -1,123 +1,43 @@
-import { useQuery } from '@tanstack/react-query';
-import { notification } from 'antd';
-import {
-  allowInsecureRequests,
-  discoveryRequest,
-  processDiscoveryResponse,
-  refreshTokenGrantRequest,
-  processRefreshTokenResponse
-} from 'oauth4webapi';
 import React from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
-import { isSafeRedirectPath, redirectToQueryParam, refreshTokenKey } from '@ui/config/auth';
+import { isSafeRedirectPath, redirectToQueryParam } from '@ui/config/auth';
 import { paths } from '@ui/config/paths';
-import { useGetPublicConfig } from '@ui/gen/api/v2/system/system';
+import { refreshOnce } from '@ui/lib/api/token-refresh';
 
 import { LoadingState } from '../common';
 
 import { useAuthContext } from './context/use-auth-context';
-import { oidcClientAuth, shouldAllowIdpHttpRequest as shouldAllowHttpRequest } from './oidc-utils';
 
 export const TokenRenew = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { login: onLogin, logout } = useAuthContext();
-
-  const { data: response, isError } = useGetPublicConfig();
-  const data = response?.data;
-
-  const issuerUrl = React.useMemo(() => {
-    try {
-      return data?.oidcConfig?.issuerUrl ? new URL(data?.oidcConfig?.issuerUrl) : undefined;
-    } catch (_) {
-      notification.error({
-        message: 'Invalid issuerURL',
-        placement: 'bottomRight'
-      });
-    }
-  }, [data?.oidcConfig?.issuerUrl]);
-
-  const client = React.useMemo(
-    () =>
-      data?.oidcConfig?.clientId
-        ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          { client_id: data?.oidcConfig?.clientId, token_endpoint_auth_method: 'none' as any }
-        : undefined,
-    [data?.oidcConfig?.clientId]
-  );
-
-  const { data: as, isError: isASError } = useQuery({
-    queryKey: [issuerUrl],
-    queryFn: () =>
-      issuerUrl &&
-      discoveryRequest(issuerUrl, {
-        [allowInsecureRequests]: shouldAllowHttpRequest()
-      }).then((response) => processDiscoveryResponse(issuerUrl, response)),
-    enabled: !!issuerUrl
-  });
-
-  React.useEffect(() => {
-    const refreshToken = localStorage.getItem(refreshTokenKey);
-
-    if (!refreshToken) {
-      navigate(paths.home);
-
-      return;
-    }
-
-    if (!as || !client) {
-      return;
-    }
-
-    (async () => {
-      const redirectQuery = searchParams.get(redirectToQueryParam);
-      const safeRedirectQuery = isSafeRedirectPath(redirectQuery) ? redirectQuery : null;
-      try {
-        const response = await refreshTokenGrantRequest(as, client, oidcClientAuth, refreshToken, {
-          [allowInsecureRequests]: shouldAllowHttpRequest(),
-          additionalParameters: [['client_id', client.client_id]]
-        });
-
-        const result = await processRefreshTokenResponse(as, client, response);
-
-        if (!result.id_token) {
-          notification.error({
-            message: 'OIDC: Proccess Authorization Code Grant Response error',
-            placement: 'bottomRight'
-          });
-          logout();
-          navigate(
-            `${paths.login}${redirectQuery ? `?${redirectToQueryParam}=${redirectQuery}` : ''}`
-          );
-          return;
-        }
-
-        onLogin(result.id_token, result.refresh_token);
-        if (safeRedirectQuery) {
-          // safeRedirectQuery is an absolute path that already carries the
-          // deployed basePath, so go through window.location to avoid
-          // react-router applying its basename a second time.
-          window.location.replace(window.location.origin + safeRedirectQuery);
-        } else {
-          navigate(paths.home);
-        }
-      } catch (err) {
-        logout();
-        navigate(
-          `${paths.login}${redirectQuery ? `?${redirectToQueryParam}=${redirectQuery}` : ''}`
-        );
-      }
-    })();
-  }, [as, client]);
+  const { logout } = useAuthContext();
 
   React.useEffect(() => {
     const redirectQuery = searchParams.get(redirectToQueryParam);
-    if (isError || isASError) {
+    const target =
+      isSafeRedirectPath(redirectQuery) && redirectQuery !== paths.tokenRenew
+        ? redirectQuery
+        : null;
+
+    (async () => {
+      if (await refreshOnce()) {
+        if (target) {
+          // target is an absolute path that already carries the deployed
+          // basePath, so go through window.location to avoid react-router
+          // applying its basename a second time.
+          window.location.replace(window.location.origin + target);
+        } else {
+          navigate(paths.home);
+        }
+        return;
+      }
+
       logout();
-      navigate(`${paths.login}${redirectQuery ? `?${redirectToQueryParam}=${redirectQuery}` : ''}`);
-    }
-  }, [isError, isASError]);
+      navigate(`${paths.login}${target ? `?${redirectToQueryParam}=${target}` : ''}`);
+    })();
+  }, []);
 
   return (
     <div className='pt-40'>

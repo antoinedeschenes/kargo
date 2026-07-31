@@ -1,10 +1,14 @@
-import { authTokenKey } from '@ui/config/auth';
-import { getBaseUrl } from '@ui/lib/api/custom-fetch';
+import { getBaseUrl } from '@ui/lib/api/base-url';
+import { getValidToken, refreshOnce } from '@ui/lib/api/token-refresh';
 
 // Code the server emits (as `event: error`) when the resourceVersion used to
 // seed a watch is older than the API server's watch window. Clients respond by
 // relisting to obtain a fresh, watchable resourceVersion.
 export const WATCH_ERROR_EXPIRED = 'out_of_range';
+
+// Code readSSEStream reports when the server rejects the stream's token.
+// Clients respond by renewing the token and reopening.
+export const WATCH_ERROR_UNAUTHORIZED = 'unauthorized';
 
 export type SSEWatchError = { code: string; message: string };
 
@@ -14,11 +18,16 @@ export async function* readSSEStream<T>(
   url: string,
   signal: AbortSignal
 ): AsyncGenerator<SSEWatchEvent<T>> {
-  const token = localStorage.getItem(authTokenKey);
+  const token = await getValidToken();
   const response = await fetch(`${getBaseUrl()}${url}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     signal
   });
+
+  if (response.status === 401) {
+    yield { error: { code: WATCH_ERROR_UNAUTHORIZED, message: response.statusText } };
+    return;
+  }
 
   if (!response.ok || !response.body) {
     return;
@@ -66,7 +75,9 @@ export async function* readSSEStream<T>(
 // from `seedResourceVersion()` (kept out of any React effect deps by the caller
 // so a cache-advancing event never tears the stream down). If the seed is too
 // old, the server reports `WATCH_ERROR_EXPIRED`; we then `relist()` for a fresh
-// resourceVersion and reopen. A clean close or generic error stops the stream
+// resourceVersion and reopen. If the token is rejected, the stream reports
+// `WATCH_ERROR_UNAUTHORIZED`; we renew it and reopen with the same
+// resourceVersion. A clean close or generic error stops the stream
 // (matching the pre-seeding behavior — no auto-reconnect).
 export async function runSeededWatch<T>(params: {
   signal: AbortSignal;
@@ -79,11 +90,16 @@ export async function runSeededWatch<T>(params: {
 
   for (;;) {
     let expired = false;
+    let unauthorized = false;
     try {
       for await (const event of readSSEStream<T>(params.buildUrl(resourceVersion), params.signal)) {
         if ('error' in event) {
           if (event.error.code === WATCH_ERROR_EXPIRED) {
             expired = true;
+            break;
+          }
+          if (event.error.code === WATCH_ERROR_UNAUTHORIZED) {
+            unauthorized = true;
             break;
           }
           continue;
@@ -95,7 +111,18 @@ export async function runSeededWatch<T>(params: {
       return;
     }
 
-    if (params.signal.aborted || !expired) {
+    if (params.signal.aborted) {
+      return;
+    }
+
+    if (unauthorized) {
+      if (!(await refreshOnce())) {
+        return;
+      }
+      continue;
+    }
+
+    if (!expired) {
       return;
     }
 
@@ -126,7 +153,7 @@ function isNewerResourceVersion(incoming?: string, existing?: string): boolean {
 // lines with `\n` reconstructs the original chunk verbatim. Unlike
 // readSSEStream, a non-OK response throws so callers can surface the error.
 export async function* readSSETextStream(url: string, signal: AbortSignal): AsyncGenerator<string> {
-  const token = localStorage.getItem(authTokenKey);
+  const token = await getValidToken();
   const response = await fetch(`${getBaseUrl()}${url}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     signal

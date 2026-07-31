@@ -11,29 +11,21 @@
  */
 
 import { authTokenKey, redirectToQueryParam, refreshTokenKey } from '@ui/config/auth';
-import { basePath, withBasePath } from '@ui/config/base-path';
+import { withBasePath } from '@ui/config/base-path';
 import { paths } from '@ui/config/paths';
-import { parseJwtPayload } from '@ui/utils/jwt-payload';
 
-export const getBaseUrl = (): string => {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
-  }
-  return basePath();
-};
+import { getBaseUrl } from './base-url';
+import { clearTokens, getValidToken, refreshOnce } from './token-refresh';
 
 const logout = () => {
-  localStorage.removeItem(authTokenKey);
-  localStorage.removeItem(refreshTokenKey);
-  window.location.replace(
-    `${withBasePath(paths.login)}?${redirectToQueryParam}=${window.location.pathname}`
-  );
-};
-
-const renewToken = () => {
-  window.location.replace(
-    `${withBasePath(paths.tokenRenew)}?${redirectToQueryParam}=${window.location.pathname}`
-  );
+  clearTokens();
+  const { pathname } = window.location;
+  // Omit redirectTo when it would point the login page back at itself.
+  const redirect =
+    pathname === withBasePath(paths.login)
+      ? ''
+      : `?${redirectToQueryParam}=${encodeURIComponent(pathname)}`;
+  window.location.replace(`${withBasePath(paths.login)}${redirect}`);
 };
 
 // Reduces a request URL to just its lowercased path, so that neither a query
@@ -72,33 +64,22 @@ const authExemptPaths = new Set(
  * @param options - The fetch options (method, body, headers, etc.)
  * @returns Promise resolving to the response envelope
  */
-export const customFetch = async <T>(url: string, options?: RequestInit): Promise<T> => {
+export const customFetch = async <T>(
+  url: string,
+  options?: RequestInit,
+  isRetry = false
+): Promise<T> => {
   const baseUrl = getBaseUrl();
   const fullUrl = `${baseUrl}${url}`;
 
   const requiresAuth = !authExemptPaths.has(normalizePath(url));
-  const token = requiresAuth ? localStorage.getItem(authTokenKey) : null;
-  const refreshToken = localStorage.getItem(refreshTokenKey);
+  const hadToken = requiresAuth && !!localStorage.getItem(authTokenKey);
+  // Renews in place when the stored token has expired.
+  const token = requiresAuth ? await getValidToken() : null;
 
-  if (token) {
-    let isTokenExpired: boolean;
-    try {
-      const payload = parseJwtPayload<{ exp?: number }>(token);
-      isTokenExpired = typeof payload.exp === 'number' && Date.now() >= payload.exp * 1000;
-    } catch (_) {
-      logout();
-      throw new ApiError(401, 'Unauthorized', 'Invalid token');
-    }
-
-    if (isTokenExpired && refreshToken) {
-      renewToken();
-      throw new ApiError(401, 'Unauthorized', 'Token expired');
-    }
-
-    if (isTokenExpired && !refreshToken) {
-      logout();
-      throw new ApiError(401, 'Unauthorized', 'Token expired');
-    }
+  if (hadToken && !token) {
+    logout();
+    throw new ApiError(401, 'Unauthorized', 'Token expired');
   }
 
   const headers: Record<string, string> = {
@@ -131,6 +112,12 @@ export const customFetch = async <T>(url: string, options?: RequestInit): Promis
   });
 
   if (requiresAuth && response.status === 401) {
+    // The server may reject a token this client still considers live.
+    if (!isRetry && localStorage.getItem(refreshTokenKey)) {
+      if (await refreshOnce()) {
+        return customFetch<T>(url, options, true);
+      }
+    }
     logout();
   }
 
